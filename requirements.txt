@@ -1,0 +1,4 @@
+# 이 앱은 표준 라이브러리만 사용합니다 (tkinter, subprocess, threading 등).
+# Tkinter는 macOS의 python.org 공식 빌드와 Homebrew python-tk@3.x 패키지에 포함됩니다.
+# 필요 시 다음 명령으로 설치하세요:
+#   brew install python-tk
