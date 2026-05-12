@@ -22,6 +22,8 @@ from typing import Optional
 from automator import (
     AutomatorError,
     CURSOR_MODES,
+    DEFAULT_MODE_KEY,
+    SendOptions,
     check_accessibility_permission,
     send_prompt_to_cursor,
 )
@@ -43,6 +45,23 @@ def _format_seconds(total: int) -> str:
     if h:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _build_send_options(cfg: AppConfig, **overrides) -> SendOptions:
+    """AppConfig → automator.SendOptions 변환. overrides로 일부 필드 덮어쓰기 가능."""
+    base = dict(
+        open_chat=cfg.open_chat,
+        press_enter=cfg.press_enter,
+        activate_delay=cfg.activate_delay,
+        open_delay=cfg.open_delay,
+        paste_delay=cfg.paste_delay,
+        pre_send_delay=cfg.pre_send_delay,
+        preserve_clipboard=cfg.preserve_clipboard,
+        command_text_override=cfg.command_text_override,
+        verify_cursor_frontmost=cfg.verify_cursor_frontmost,
+    )
+    base.update(overrides)
+    return SendOptions(**base)
 
 
 def _parse_interval(value_str: str, unit: str) -> int:
@@ -210,10 +229,33 @@ class CursorAutoPrompterApp:
             variable=self.preserve_clipboard_var,
         ).grid(row=2, column=4, columnspan=2, sticky="w", pady=(6, 0))
 
+        # 고급: Command Palette 명령어 override (Cursor Agents Window 모드 전용)
+        ttk.Label(opts, text="Palette 명령어:").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        self.command_text_var = tk.StringVar()
+        cmd_entry = ttk.Entry(opts, textvariable=self.command_text_var)
+        cmd_entry.grid(
+            row=3, column=1, columnspan=4, sticky="ew", pady=(8, 0), padx=(4, 8)
+        )
+        self.verify_frontmost_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts,
+            text="Cursor 프론트 검증",
+            variable=self.verify_frontmost_var,
+        ).grid(row=3, column=5, sticky="w", pady=(8, 0))
+
+        ttk.Label(
+            opts,
+            text="(Cursor Agents Window 모드에서만 사용. 비우면 'Agents Window'. "
+            "Cmd+I/단축키 모드에서는 무시됨.)",
+            foreground="#666",
+        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(2, 0))
+
         # ----- 4) 컨트롤 버튼 -----
         ctrl = ttk.Frame(outer)
         ctrl.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        for col in range(4):
+        for col in range(5):
             ctrl.columnconfigure(col, weight=1)
 
         self.start_btn = ttk.Button(ctrl, text="▶ 시작", command=self._on_start)
@@ -227,10 +269,15 @@ class CursorAutoPrompterApp:
         self.test_btn = ttk.Button(ctrl, text="⚡ 즉시 한 번 보내기", command=self._on_test)
         self.test_btn.grid(row=0, column=2, sticky="ew", padx=4)
 
+        self.diag_btn = ttk.Button(
+            ctrl, text="🔍 채팅창만 열어보기 (진단)", command=self._on_diag_open_only
+        )
+        self.diag_btn.grid(row=0, column=3, sticky="ew", padx=4)
+
         self.clear_log_btn = ttk.Button(
             ctrl, text="🗑 로그 지우기", command=self._on_clear_log
         )
-        self.clear_log_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        self.clear_log_btn.grid(row=0, column=4, sticky="ew", padx=(4, 0))
 
         # ----- 5) 상태바 -----
         status = ttk.Frame(outer)
@@ -289,13 +336,15 @@ class CursorAutoPrompterApp:
             self.interval_value_var.set(str(cfg.interval_seconds))
             self.interval_unit_var.set("초")
 
-        mode = CURSOR_MODES.get(cfg.mode_key, CURSOR_MODES["agent"])
+        mode = CURSOR_MODES.get(cfg.mode_key, CURSOR_MODES[DEFAULT_MODE_KEY])
         self.mode_var.set(mode.label)
         self.run_immediately_var.set(cfg.run_immediately)
         self.max_runs_var.set("" if cfg.max_runs is None else str(cfg.max_runs))
         self.press_enter_var.set(cfg.press_enter)
         self.open_chat_var.set(cfg.open_chat)
         self.preserve_clipboard_var.set(cfg.preserve_clipboard)
+        self.command_text_var.set(cfg.command_text_override)
+        self.verify_frontmost_var.set(cfg.verify_cursor_frontmost)
         self.recent_combo["values"] = cfg.recent_prompts
 
     def _collect_config_from_ui(self) -> AppConfig:
@@ -307,7 +356,8 @@ class CursorAutoPrompterApp:
         # 모드 라벨 → key
         label = self.mode_var.get()
         cfg.mode_key = next(
-            (k for k, m in CURSOR_MODES.items() if m.label == label), "agent"
+            (k for k, m in CURSOR_MODES.items() if m.label == label),
+            DEFAULT_MODE_KEY,
         )
         cfg.run_immediately = bool(self.run_immediately_var.get())
         max_runs_str = self.max_runs_var.get().strip()
@@ -317,6 +367,8 @@ class CursorAutoPrompterApp:
         cfg.press_enter = bool(self.press_enter_var.get())
         cfg.open_chat = bool(self.open_chat_var.get())
         cfg.preserve_clipboard = bool(self.preserve_clipboard_var.get())
+        cfg.command_text_override = self.command_text_var.get().strip()
+        cfg.verify_cursor_frontmost = bool(self.verify_frontmost_var.get())
         cfg.window_geometry = self.root.geometry()
         return cfg
 
@@ -396,24 +448,74 @@ class CursorAutoPrompterApp:
             target=self._send_once_async, args=(cfg,), daemon=True
         ).start()
 
+    def _on_diag_open_only(self) -> None:
+        """채팅창/Agents 창만 열고 프롬프트 입력은 하지 않는 진단 버튼.
+
+        '시작' 시 'Notification processing demo' 같은 엉뚱한 창이 뜬다면
+        이 버튼을 눌러서 다음을 확인:
+          1) Cursor가 정상적으로 프론트가 되는가?
+          2) Agents Window 모드에서는 Command Palette가 열리고
+             명령어가 정확히 입력되는가?
+        """
+        try:
+            cfg = self._collect_config_from_ui()
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, f"설정 오류: {exc}")
+            return
+
+        from automator import get_frontmost_app
+
+        self._log("진단: Cursor 활성화 + 채팅창/팔레트만 열기 시도", "info")
+        threading.Thread(
+            target=self._diag_async, args=(cfg,), daemon=True
+        ).start()
+
+    def _diag_async(self, cfg: AppConfig) -> None:
+        from automator import get_frontmost_app
+
+        before = get_frontmost_app()
+        self._post(
+            lambda b=before: self._log(f"진단: 시작 시 frontmost = '{b}'", "info")
+        )
+        try:
+            send_prompt_to_cursor(
+                cfg.prompt or " ",
+                mode_key=cfg.mode_key,
+                options=_build_send_options(cfg, skip_paste_and_send=True),
+            )
+        except AutomatorError as exc:
+            msg = f"진단: 실패 — {exc}"
+            self._post(lambda m=msg: self._log(m, "err"))
+            return
+        except Exception as exc:  # noqa: BLE001
+            msg = f"진단: 예기치 못한 오류 — {exc}"
+            self._post(lambda m=msg: self._log(m, "err"))
+            return
+
+        # 작업 후 다시 frontmost 체크
+        after = get_frontmost_app()
+        self._post(
+            lambda a=after: self._log(
+                f"진단: 작업 후 frontmost = '{a}' "
+                f"(Cursor 외 다른 앱이 보이면 활성화 실패)",
+                "warn" if a != "Cursor" else "ok",
+            )
+        )
+
     def _send_once_async(self, cfg: AppConfig) -> None:
         try:
             send_prompt_to_cursor(
                 cfg.prompt,
                 mode_key=cfg.mode_key,
-                open_chat=cfg.open_chat,
-                press_enter=cfg.press_enter,
-                activate_delay=cfg.activate_delay,
-                open_delay=cfg.open_delay,
-                paste_delay=cfg.paste_delay,
-                pre_send_delay=cfg.pre_send_delay,
-                preserve_clipboard=cfg.preserve_clipboard,
+                options=_build_send_options(cfg),
             )
         except AutomatorError as exc:
-            self._post(lambda: self._log(f"전송 실패: {exc}", "err"))
+            msg = f"전송 실패: {exc}"
+            self._post(lambda m=msg: self._log(m, "err"))
             return
         except Exception as exc:  # noqa: BLE001
-            self._post(lambda: self._log(f"예기치 못한 오류: {exc}", "err"))
+            msg = f"예기치 못한 오류: {exc}"
+            self._post(lambda m=msg: self._log(m, "err"))
             return
         self._post(lambda: self._log("전송 성공", "ok"))
 
@@ -430,35 +532,32 @@ class CursorAutoPrompterApp:
             send_prompt_to_cursor(
                 cfg.prompt,
                 mode_key=cfg.mode_key,
-                open_chat=cfg.open_chat,
-                press_enter=cfg.press_enter,
-                activate_delay=cfg.activate_delay,
-                open_delay=cfg.open_delay,
-                paste_delay=cfg.paste_delay,
-                pre_send_delay=cfg.pre_send_delay,
-                preserve_clipboard=cfg.preserve_clipboard,
+                options=_build_send_options(cfg),
             )
         except AutomatorError as exc:
-            self._post(
-                lambda: self._log(f"[{run_count}회차] 전송 실패: {exc}", "err")
-            )
+            err_msg = f"[{run_count}회차] 전송 실패: {exc}"
+            self._post(lambda m=err_msg: self._log(m, "err"))
             return
+        except Exception as exc:  # noqa: BLE001
+            err_msg = f"[{run_count}회차] 예기치 못한 오류: {exc}"
+            self._post(lambda m=err_msg: self._log(m, "err"))
+            return
+        ok_msg = f"[{run_count}회차] 전송 성공"
+        n = run_count
         self._post(
-            lambda: (
-                self._log(f"[{run_count}회차] 전송 성공", "ok"),
-                self.run_count_var.set(str(run_count)),
+            lambda m=ok_msg, c=n: (
+                self._log(m, "ok"),
+                self.run_count_var.set(str(c)),
             )
         )
 
     def _on_scheduled_tick(self, remaining: int, run_count: int) -> None:
-        self._post(
-            lambda: self._update_status(
-                f"실행 중 — 다음 전송까지 {_format_seconds(remaining)}"
-            )
-        )
+        text = f"실행 중 — 다음 전송까지 {_format_seconds(remaining)}"
+        self._post(lambda t=text: self._update_status(t))
 
     def _on_scheduled_error(self, exc: BaseException) -> None:
-        self._post(lambda: self._log(f"스케줄러 오류: {exc}", "err"))
+        msg = f"스케줄러 오류: {exc}"
+        self._post(lambda m=msg: self._log(m, "err"))
 
     def _on_scheduled_stop(self, reason: str) -> None:
         text = {
@@ -466,9 +565,10 @@ class CursorAutoPrompterApp:
             "max_runs_reached": "최대 실행 횟수 도달",
             "completed": "완료",
         }.get(reason, reason)
+        msg = f"정지됨 ({text})"
         self._post(
-            lambda: (
-                self._log(f"정지됨 ({text})", "warn"),
+            lambda m=msg: (
+                self._log(m, "warn"),
                 self._set_running_ui(False),
                 self._update_status("대기 중"),
             )
